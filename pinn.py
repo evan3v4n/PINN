@@ -6,23 +6,15 @@ from torch import nn
 from torch.func import functional_call, grad, vmap
 
 
+
 class LinearNN(nn.Module):
     def __init__(
         self,
-        num_inputs: int = 1,
-        num_layers: int = 1,
-        num_neurons: int = 5,
+        num_inputs: int = 3,  # Adjust to 3 for (x, y, z)
+        num_layers: int = 3,  # Increase layers for complexity
+        num_neurons: int = 10,  # Increase neurons to handle 3D complexity
         act: nn.Module = nn.Tanh(),
     ) -> None:
-        """Basic neural network architecture with linear layers
-        
-        Args:
-            num_inputs (int, optional): the dimensionality of the input tensor
-            num_layers (int, optional): the number of hidden layers
-            num_neurons (int, optional): the number of neurons for each hidden layer
-            act (nn.Module, optional): the non-linear activation function to use for stitching
-                linear layers togeter
-        """
         super().__init__()
         
         self.num_inputs = num_inputs
@@ -45,65 +37,73 @@ class LinearNN(nn.Module):
         self.network = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x.reshape(-1, 1)).squeeze()
+        return self.network(x).squeeze(-1)
 
 
-def make_forward_fn(
-    model: nn.Module,
-    derivative_order: int = 1,
-) -> list[Callable]:
-    """Make a functional forward pass and gradient functions given an input model
 
-    This function creates a set of functional calls of the input model
 
-    It returns a list of composable v-mapped version of the forward pass
-    and of higher-order derivatives with respect to the inputs as
-    specified by the input argument `derivative_order`
 
-    Args:
-        model (nn.Module): the model to make the functional calls for. It can be any subclass of
-            a nn.Module
-        derivative_order (int, optional): Up to which order return functions for computing the
-            derivative of the model with respect to the inputs
 
-    Returns:
-        list[Callable]: A list of functions where each element corresponds to
-            a v-mapped version of the model forward pass and its derivatives. The
-            0-th element is always the forward pass and, depending on the value of
-            the `derivative_order` argument, the following elements corresponds to
-            the i-th order derivative function with respect to the model inputs. The
-            vmap ensures efficient support for batched inputs
-    """
-    # notice that `functional_call` supports batched input by default
-    # thus there is not need to call vmap on it, as it's instead the case
-    # for the derivative calls
+def make_loss_fn(f: Callable, dfdx: Callable) -> Callable:
+    def loss_fn(params: torch.Tensor, inputs: torch.Tensor):
+        # Ensure inputs tensor has the correct shape: [batch_size, 3]
+        if inputs.shape[1] != 3:
+            raise ValueError(f"Expected inputs to have shape [batch_size, 3], but got {inputs.shape}")
+
+        # Compute the derivatives (Laplacian components)
+        dfdx_val = dfdx(inputs, params)  # Pass the full input tensor
+        print(f"dfdx_val shape: {dfdx_val.shape}")
+
+        # Compute the Laplacian as the sum of the second derivatives
+        laplacian = dfdx_val  # Assuming `dfdx_val` includes all partial derivatives
+
+        print(f"laplacian shape: {laplacian.shape}")
+
+        # Boundary condition (example: zero boundary condition)
+        boundary = torch.zeros_like(inputs[:, 0:1])  # Ensure this has the same shape as one input column
+
+        # Compute the loss as the sum of the Laplacian loss and boundary loss
+        loss = nn.MSELoss()
+        laplacian_loss = loss(laplacian, torch.zeros_like(laplacian))  # Interior points loss
+        boundary_loss = loss(f(inputs, params), boundary)  # Boundary condition loss
+
+        # Total loss is the sum of interior and boundary losses
+        loss_value = laplacian_loss + boundary_loss
+
+        return loss_value
+
+    return loss_fn
+
+
+
+
+
+
+
+
+def make_forward_fn(model: nn.Module, derivative_order: int = 1) -> list[Callable]:
+    """Make a functional forward pass and gradient functions for 3D"""
+
     def f(x: torch.Tensor, params: dict[str, torch.nn.Parameter] | tuple[torch.nn.Parameter, ...]) -> torch.Tensor:
-        
-        # the functional optimizer works with parameters represented as a tuple instead
-        # of the dictionary form required by the `functional_call` API 
-        # here we perform the conversion from tuple to dictionary
         if isinstance(params, tuple):
             params_dict = tuple_to_dict_parameters(model, params)
         else:
             params_dict = params
-
         return functional_call(model, params_dict, (x, ))
 
-    fns = []
-    fns.append(f)
+    fns = [f]
 
     dfunc = f
     for _ in range(derivative_order):
+        # Derivative with respect to the entire input (x, y, z together)
+        dfdx = grad(dfunc, argnums=0)  # Gradient w.r.t. x, y, z together
 
-        # first compute the derivative function
-        dfunc = grad(dfunc)
-
-        # then use vmap to support batching
-        dfunc_vmap = vmap(dfunc, in_dims=(0, None))
-
-        fns.append(dfunc_vmap)
+        # Use vmap to support batching, ensure you map over the first dimension
+        fns.append(lambda x, params: vmap(dfdx, in_dims=(0, None))(x, params))
 
     return fns
+
+
 
 
 def tuple_to_dict_parameters(
